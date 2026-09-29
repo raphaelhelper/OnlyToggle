@@ -16,7 +16,6 @@ import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
-import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -28,107 +27,105 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
+import androidx.core.content.IntentCompat
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlin.math.abs
 
+/**
+ * Ý tưởng: VirtualDisplay chỉ đẩy frame khi màn hình THAY ĐỔI, nên không thể
+ * "chờ frame mới" sau khi bấm (màn hình đứng yên = không bao giờ có frame).
+ * Vì vậy luôn giữ frame mới nhất; bấm bong bóng là dùng luôn frame đó -> OCR ngay.
+ */
 class FloatingService : Service() {
 
     private lateinit var wm: WindowManager
-    private val handler = Handler(Looper.getMainLooper())
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+    private val handler = Handler(Looper.getMainLooper())
+
+    private var projection: MediaProjection? = null
+    private var display: VirtualDisplay? = null
+    private var reader: ImageReader? = null
+    private var latest: Image? = null   // frame màn hình mới nhất
 
     private var bubble: View? = null
     private var overlay: View? = null
-    private var projection: MediaProjection? = null
-    private var reader: ImageReader? = null
-    private var display: VirtualDisplay? = null
-    private var captureRequested = false
+    private var scanning = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        startForegroundNotification()
+        startAsForeground()   // phải gọi trước getMediaProjection (Android 14+)
     }
 
     @Suppress("DEPRECATION")
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val code = intent?.getIntExtra("RESULT_CODE", Activity.RESULT_OK) ?: 0
-        val data = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
-            intent?.getParcelableExtra("DATA_INTENT", Intent::class.java)
-        else
-            intent?.getParcelableExtra<Intent>("DATA_INTENT")
+        val data = intent?.let { IntentCompat.getParcelableExtra(it, "DATA_INTENT", Intent::class.java) }
+        if (data == null || projection != null) return START_NOT_STICKY
 
-        if (data == null) return START_NOT_STICKY
-
+        val code = intent.getIntExtra("RESULT_CODE", Activity.RESULT_OK)
         val pm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        projection = pm.getMediaProjection(code, data)
-        if (projection == null) {
-            toast("Không tạo được MediaProjection!")
-            stopSelf()
-            return START_NOT_STICKY
-        }
+        val mp = pm.getMediaProjection(code, data) ?: run { stopSelf(); return START_NOT_STICKY }
+        projection = mp
 
-        // Android 14+ bắt buộc đăng ký callback trước khi tạo VirtualDisplay
-        projection!!.registerCallback(object : MediaProjection.Callback() {}, handler)
+        mp.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() { stopSelf() }
+        }, handler)
 
-        val m = DisplayMetrics()
-        wm.defaultDisplay.getRealMetrics(m)
+        val m = DisplayMetrics().also { wm.defaultDisplay.getRealMetrics(it) }
 
-        reader = ImageReader.newInstance(m.widthPixels, m.heightPixels, PixelFormat.RGBA_8888, 2).apply {
+        reader = ImageReader.newInstance(m.widthPixels, m.heightPixels, PixelFormat.RGBA_8888, 3).apply {
             setOnImageAvailableListener({ r ->
                 val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
-                if (captureRequested) {
-                    captureRequested = false
-                    toBitmap(img)?.let { ocr(it) } ?: toast("Không chuyển được ảnh màn hình!")
-                }
-                img.close()
+                latest?.close()
+                latest = img
             }, handler)
         }
 
-        display = projection!!.createVirtualDisplay(
-            "ScreenCapture", m.widthPixels, m.heightPixels, m.densityDpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader!!.surface, null, null
+        display = mp.createVirtualDisplay(
+            "WordPopupCapture", m.widthPixels, m.heightPixels, m.densityDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader!!.surface, null, handler
         )
 
         showBubble()
         return START_NOT_STICKY
     }
 
-    // ---------- Bong bóng ----------
+    // ---------- Bong bóng: kéo được, bấm để quét ----------
 
     @SuppressLint("ClickableViewAccessibility")
     private fun showBubble() {
-        if (bubble != null) return
-
         val view = LayoutInflater.from(this).inflate(R.layout.layout_bubble, null)
-        val lp = overlayParams(WindowManager.LayoutParams.WRAP_CONTENT).apply {
+        val lp = layoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 100
-            y = 300
+            x = 100; y = 300
         }
 
         var startX = 0; var startY = 0
-        var touchX = 0f; var touchY = 0f
+        var downX = 0f; var downY = 0f
 
         view.setOnTouchListener { _, e ->
             when (e.action) {
                 MotionEvent.ACTION_DOWN -> {
                     startX = lp.x; startY = lp.y
-                    touchX = e.rawX; touchY = e.rawY
+                    downX = e.rawX; downY = e.rawY
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    lp.x = startX + (e.rawX - touchX).toInt()
-                    lp.y = startY + (e.rawY - touchY).toInt()
+                    lp.x = startX + (e.rawX - downX).toInt()
+                    lp.y = startY + (e.rawY - downY).toInt()
                     wm.updateViewLayout(view, lp)
                 }
-                MotionEvent.ACTION_UP -> {
-                    if (abs(e.rawX - touchX) < 10 && abs(e.rawY - touchY) < 10) requestCapture()
-                }
+                MotionEvent.ACTION_UP ->
+                    if (abs(e.rawX - downX) < 10 && abs(e.rawY - downY) < 10) scan()
             }
             true
         }
@@ -137,24 +134,29 @@ class FloatingService : Service() {
         wm.addView(view, lp)
     }
 
-    private fun requestCapture() {
-        if (captureRequested) return
-        captureRequested = true
-        toast("Đang quét màn hình...")
+    // ---------- Quét: OCR frame mới nhất ----------
+
+    private fun scan() {
+        if (scanning || overlay != null) return
+        val img = latest ?: return toast("Chưa có ảnh màn hình, thử lại")
+
+        // Bitmap giữ nguyên phần đệm bên phải; tọa độ chữ vẫn khớp màn hình
+        val plane = img.planes[0]
+        val bmp = Bitmap.createBitmap(plane.rowStride / plane.pixelStride, img.height, Bitmap.Config.ARGB_8888)
+        plane.buffer.rewind()
+        bmp.copyPixelsFromBuffer(plane.buffer)
+
+        scanning = true
+        recognizer.process(InputImage.fromBitmap(bmp, 0))
+            .addOnSuccessListener { showOverlay(it) }
+            .addOnFailureListener { toast("OCR lỗi") }
+            .addOnCompleteListener { scanning = false }
     }
 
-    // ---------- OCR + chạm chọn từ ----------
-
-    private fun ocr(bitmap: Bitmap) {
-        recognizer.process(InputImage.fromBitmap(bitmap, 0))
-            .addOnSuccessListener { showTouchOverlay(it) }
-            .addOnFailureListener { toast("Không thể nhận diện văn bản!") }
-    }
+    // ---------- Lớp xanh: chạm vào từ nào thì lấy từ đó ----------
 
     @SuppressLint("ClickableViewAccessibility")
-    private fun showTouchOverlay(text: Text) {
-        if (overlay != null) return
-
+    private fun showOverlay(text: Text) {
         val view = View(this).apply { setBackgroundColor(0x3300FF00) }
 
         view.setOnTouchListener { _, e ->
@@ -167,75 +169,56 @@ class FloatingService : Service() {
                     .firstOrNull { it.boundingBox?.contains(x, y) == true }
                     ?.text
 
-                toast(if (word != null) "TỪ BẤM: [$word]" else "KHÔNG TÌM THẤY TỪ")
-                removeOverlay()
+                toast(word?.let { "TỪ: [$it]" } ?: "Không tìm thấy từ")
+                closeOverlay()
             }
             true
         }
 
         overlay = view
-        wm.addView(view, overlayParams(WindowManager.LayoutParams.MATCH_PARENT).apply {
-            height = WindowManager.LayoutParams.MATCH_PARENT
-        })
+        wm.addView(
+            view,
+            layoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+            )
+        )
     }
 
-    private fun removeOverlay() {
+    private fun closeOverlay() {
         overlay?.let { runCatching { wm.removeView(it) } }
         overlay = null
     }
 
     // ---------- Tiện ích ----------
 
-    @Suppress("DEPRECATION")
-    private fun overlayParams(width: Int) = WindowManager.LayoutParams(
-        width,
-        WindowManager.LayoutParams.WRAP_CONTENT,
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        else
-            WindowManager.LayoutParams.TYPE_PHONE,
-        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-        PixelFormat.TRANSLUCENT
+    private fun layoutParams(w: Int, h: Int, flags: Int) = WindowManager.LayoutParams(
+        w, h, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, flags, PixelFormat.TRANSLUCENT
     )
 
-    private fun toBitmap(image: Image): Bitmap? = try {
-        val p = image.planes[0]
-        val fullWidth = p.rowStride / p.pixelStride
-        val raw = Bitmap.createBitmap(fullWidth, image.height, Bitmap.Config.ARGB_8888)
-        raw.copyPixelsFromBuffer(p.buffer)
-        Bitmap.createBitmap(raw, 0, 0, image.width, image.height)
-    } catch (e: Exception) {
-        null
-    }
+    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 
-    private fun toast(msg: String) =
-        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
-
-    private fun startForegroundNotification() {
-        val channelId = "floating_service_channel"
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            getSystemService(NotificationManager::class.java).createNotificationChannel(
-                NotificationChannel(channelId, "Floating Service", NotificationManager.IMPORTANCE_LOW)
-            )
-        }
-
+    private fun startAsForeground() {
+        val channelId = "word_popup_service"
+        getSystemService(NotificationManager::class.java).createNotificationChannel(
+            NotificationChannel(channelId, "Word Popup", NotificationManager.IMPORTANCE_LOW)
+        )
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("App Tra Từ Đang Chạy")
             .setContentText("Bấm bong bóng để tra từ trên màn hình")
             .setSmallIcon(R.drawable.ic_notification)
             .setOngoing(true)
             .build()
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
-            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
-        else
-            startForeground(1, notification)
+        ServiceCompat.startForeground(this, 1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
     }
 
     override fun onDestroy() {
-        removeOverlay()
+        closeOverlay()
         bubble?.let { runCatching { wm.removeView(it) } }
+        latest?.close()
         display?.release()
         reader?.close()
         projection?.stop()
