@@ -1,7 +1,5 @@
 package com.qui.wordpopup
 
-package com.example.testwordtouch
-
 import android.content.Context
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
