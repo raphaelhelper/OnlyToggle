@@ -25,6 +25,7 @@ import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
+import android.widget.ImageView
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -36,9 +37,8 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlin.math.abs
 
 /**
- * Ý tưởng: VirtualDisplay chỉ đẩy frame khi màn hình THAY ĐỔI, nên không thể
- * "chờ frame mới" sau khi bấm (màn hình đứng yên = không bao giờ có frame).
- * Vì vậy luôn giữ frame mới nhất; bấm bong bóng là dùng luôn frame đó -> OCR ngay.
+ * BẢN DEBUG: lớp phủ hiện đúng khung hình mà app chụp được (mờ 70%),
+ * kèm toast "rộng x cao, số từ". Dùng để xem khung hình ở app khác có đúng không.
  */
 class FloatingService : Service() {
 
@@ -148,16 +148,25 @@ class FloatingService : Service() {
 
         scanning = true
         recognizer.process(InputImage.fromBitmap(bmp, 0))
-            .addOnSuccessListener { showOverlay(it) }
-            .addOnFailureListener { toast("OCR lỗi") }
+            .addOnSuccessListener {
+                val n = it.textBlocks.sumOf { b -> b.lines.sumOf { l -> l.elements.size } }
+                toast("${bmp.width}x${bmp.height}, $n từ")
+                showOverlay(it, bmp)
+            }
+            .addOnFailureListener { toast("OCR lỗi: ${it.message}") }
             .addOnCompleteListener { scanning = false }
     }
 
-    // ---------- Lớp xanh: chạm vào từ nào thì lấy từ đó ----------
+    // ---------- Lớp phủ: hiện khung hình đã chụp, chạm vào từ nào thì lấy từ đó ----------
 
     @SuppressLint("ClickableViewAccessibility")
-    private fun showOverlay(text: Text) {
-        val view = View(this).apply { setBackgroundColor(0x3300FF00) }
+    private fun showOverlay(text: Text, bmp: Bitmap) {
+        val view = ImageView(this).apply {
+            setImageBitmap(bmp)
+            scaleType = ImageView.ScaleType.MATRIX   // không co giãn, canh góc trên trái
+            alpha = 0.7f
+            setBackgroundColor(0x3300FF00)
+        }
 
         view.setOnTouchListener { _, e ->
             if (e.action == MotionEvent.ACTION_DOWN) {
