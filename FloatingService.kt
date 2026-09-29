@@ -1,4 +1,4 @@
-package com.example.testwordtouch
+package com.qui.wordpopup
 
 import android.annotation.SuppressLint
 import android.app.*
