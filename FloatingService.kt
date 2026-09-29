@@ -269,7 +269,7 @@ class FloatingService : Service() {
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("App Tra Từ Đang Chạy")
             .setContentText("Bấm bong bóng để tra từ trên màn hình")
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_notification)
             .build()
 
         startForeground(1, notification)
