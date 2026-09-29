@@ -9,13 +9,16 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -25,8 +28,8 @@ import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
-import android.widget.ImageView
-import android.widget.Toast
+import android.widget.LinearLayout
+import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.IntentCompat
@@ -37,14 +40,15 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlin.math.abs
 
 /**
- * BẢN DEBUG: lớp phủ hiện đúng khung hình mà app chụp được (mờ 70%),
- * kèm toast "rộng x cao, số từ". Dùng để xem khung hình ở app khác có đúng không.
+ * Kết quả KHÔNG dùng Toast nữa (Toast bị hệ thống ẩn khi app chạy nền).
+ * Mọi thông báo đều là cửa sổ overlay vẽ đè lên app khác, có nút ✕ để tắt.
  */
 class FloatingService : Service() {
 
     private lateinit var wm: WindowManager
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     private val handler = Handler(Looper.getMainLooper())
+    private val dp by lazy { resources.displayMetrics.density }
 
     private var projection: MediaProjection? = null
     private var display: VirtualDisplay? = null
@@ -52,7 +56,8 @@ class FloatingService : Service() {
     private var latest: Image? = null   // frame màn hình mới nhất
 
     private var bubble: View? = null
-    private var overlay: View? = null
+    private var overlay: View? = null   // lớp xanh chờ chạm
+    private var popup: View? = null     // popup kết quả
     private var scanning = false
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -138,7 +143,8 @@ class FloatingService : Service() {
 
     private fun scan() {
         if (scanning || overlay != null) return
-        val img = latest ?: return toast("Chưa có ảnh màn hình, thử lại")
+        closePopup()
+        val img = latest ?: return note("Chưa có ảnh màn hình, thử lại")
 
         // Bitmap giữ nguyên phần đệm bên phải; tọa độ chữ vẫn khớp màn hình
         val plane = img.planes[0]
@@ -148,38 +154,30 @@ class FloatingService : Service() {
 
         scanning = true
         recognizer.process(InputImage.fromBitmap(bmp, 0))
-            .addOnSuccessListener {
-                val n = it.textBlocks.sumOf { b -> b.lines.sumOf { l -> l.elements.size } }
-                toast("${bmp.width}x${bmp.height}, $n từ")
-                showOverlay(it, bmp)
-            }
-            .addOnFailureListener { toast("OCR lỗi: ${it.message}") }
+            .addOnSuccessListener { showOverlay(it) }
+            .addOnFailureListener { note("OCR lỗi: ${it.message}") }
             .addOnCompleteListener { scanning = false }
     }
 
-    // ---------- Lớp phủ: hiện khung hình đã chụp, chạm vào từ nào thì lấy từ đó ----------
+    // ---------- Lớp xanh: chạm vào từ nào thì lấy từ đó ----------
 
     @SuppressLint("ClickableViewAccessibility")
-    private fun showOverlay(text: Text, bmp: Bitmap) {
-        val view = ImageView(this).apply {
-            setImageBitmap(bmp)
-            scaleType = ImageView.ScaleType.MATRIX   // không co giãn, canh góc trên trái
-            alpha = 0.7f
-            setBackgroundColor(0x3300FF00)
-        }
+    private fun showOverlay(text: Text) {
+        val elements = text.textBlocks.flatMap { it.lines }.flatMap { it.elements }
+        val view = View(this).apply { setBackgroundColor(0x2200FF00) }
 
         view.setOnTouchListener { _, e ->
             if (e.action == MotionEvent.ACTION_DOWN) {
                 val x = e.rawX.toInt()
                 val y = e.rawY.toInt()
-                val word = text.textBlocks
-                    .flatMap { it.lines }
-                    .flatMap { it.elements }
+                val word = elements
                     .firstOrNull { it.boundingBox?.contains(x, y) == true }
                     ?.text
+                    ?.trim { !it.isLetterOrDigit() }
 
-                toast(word?.let { "TỪ: [$it]" } ?: "Không tìm thấy từ")
                 closeOverlay()
+                if (word.isNullOrEmpty()) showPopup("Không tìm thấy từ (đọc được ${elements.size} từ)", x, y)
+                else showPopup(word, x, y)
             }
             true
         }
@@ -190,9 +188,7 @@ class FloatingService : Service() {
             layoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
             )
         )
     }
@@ -202,13 +198,68 @@ class FloatingService : Service() {
         overlay = null
     }
 
+    // ---------- Popup kết quả: vẽ đè lên mọi app, chỉ tắt khi bấm ✕ ----------
+
+    private fun showPopup(message: String, atX: Int, atY: Int) {
+        closePopup()
+
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding((16 * dp).toInt(), (10 * dp).toInt(), (4 * dp).toInt(), (10 * dp).toInt())
+            background = GradientDrawable().apply {
+                setColor(0xF2212121.toInt())
+                cornerRadius = 16 * dp
+            }
+            addView(TextView(context).apply {
+                text = message
+                setTextColor(Color.WHITE)
+                textSize = 20f
+                maxWidth = (240 * dp).toInt()
+            })
+            addView(TextView(context).apply {
+                text = "✕"
+                setTextColor(Color.WHITE)
+                textSize = 20f
+                setPadding((16 * dp).toInt(), (6 * dp).toInt(), (12 * dp).toInt(), (6 * dp).toInt())
+                setOnClickListener { closePopup() }
+            })
+        }
+
+        val maxX = (resources.displayMetrics.widthPixels - 300 * dp).toInt().coerceAtLeast(0)
+        val lp = layoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = (atX - 60 * dp).toInt().coerceIn(0, maxX)
+            y = (atY - 90 * dp).toInt().coerceAtLeast(0)   // nằm phía trên chỗ chạm để không che từ
+        }
+
+        popup = box
+        wm.addView(box, lp)
+    }
+
+    private fun closePopup() {
+        popup?.let { runCatching { wm.removeView(it) } }
+        popup = null
+    }
+
+    // thông báo lỗi/trạng thái cũng là popup overlay, không dùng Toast
+    private fun note(msg: String) = showPopup(msg, (40 * dp).toInt(), (160 * dp).toInt())
+
     // ---------- Tiện ích ----------
 
     private fun layoutParams(w: Int, h: Int, flags: Int) = WindowManager.LayoutParams(
-        w, h, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, flags, PixelFormat.TRANSLUCENT
-    )
-
-    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+        w, h, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+        flags or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN, PixelFormat.TRANSLUCENT
+    ).apply {
+        // Máy có tai thỏ: nếu thiếu dòng này cửa sổ bị đẩy xuống ~45px so với màn hình thật
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+    }
 
     private fun startAsForeground() {
         val channelId = "word_popup_service"
@@ -225,6 +276,7 @@ class FloatingService : Service() {
     }
 
     override fun onDestroy() {
+        closePopup()
         closeOverlay()
         bubble?.let { runCatching { wm.removeView(it) } }
         latest?.close()
