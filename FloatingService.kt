@@ -11,6 +11,8 @@ import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Rect
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -41,7 +43,7 @@ import kotlin.math.abs
 
 /**
  * Bấm bubble -> quét màn hình, hiện lớp phủ xanh che toàn màn hình.
- * Bấm từ nào -> popup của từ đó (bấm lần nữa thì tắt), nhiều popup cùng lúc.
+ * Bấm từ nào -> popup nghĩa của từ đó (bấm lần nữa thì tắt), nhiều popup cùng lúc.
  * Bấm bubble lần nữa -> tắt lớp phủ + tắt hết popup.
  * Thứ tự z (dưới -> trên): lớp phủ < bubble < popup.
  */
@@ -69,6 +71,12 @@ class FloatingService : Service() {
         super.onCreate()
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         startAsForeground()   // phải gọi trước getMediaProjection (Android 14+)
+        reloadDictionary()
+    }
+
+    private fun reloadDictionary() {
+        val ctx = applicationContext
+        Thread { Dictionary.loadIfChanged(ctx) }.start()
     }
 
     @Suppress("DEPRECATION")
@@ -152,10 +160,16 @@ class FloatingService : Service() {
         }
     }
 
-    // Window add sau thì nằm trên. Remove rồi add lại bubble để nó nổi lên trên lớp phủ.
+    // Window add sau thì nằm trên. Remove rồi add lại để nổi lên trên lớp phủ.
     private fun bringBubbleToFront() {
         val v = bubble ?: return
         val lp = bubbleLp ?: return
+        runCatching { wm.removeView(v) }
+        wm.addView(v, lp)
+    }
+
+    private fun bringPopupToFront(v: View) {
+        val lp = v.layoutParams as? WindowManager.LayoutParams ?: return
         runCatching { wm.removeView(v) }
         wm.addView(v, lp)
     }
@@ -165,6 +179,7 @@ class FloatingService : Service() {
     private fun scan() {
         if (scanning || overlay != null) return
         closeAllPopups()
+        reloadDictionary()   // file từ điển đổi thì tự nạp lại (không đổi thì bỏ qua ngay)
         val img = latest ?: return note("Chưa có ảnh màn hình, thử lại")
 
         // Bitmap giữ nguyên phần đệm bên phải; tọa độ chữ vẫn khớp màn hình
@@ -196,7 +211,7 @@ class FloatingService : Service() {
                 val word = el?.text?.trim { !it.isLetterOrDigit() }
                 // overlay KHÔNG đóng; bấm trúng chỗ trống thì bỏ qua
                 if (box != null && !word.isNullOrEmpty()) {
-                    togglePopup("${box.left},${box.top}", word, box.left, box.top)
+                    togglePopup("${box.left},${box.top}", word, box)
                 }
             }
             true
@@ -212,7 +227,7 @@ class FloatingService : Service() {
             )
         )
         bringBubbleToFront()   // bubble nằm trên lớp phủ để còn bấm tắt được
-        popups.values.forEach { bringPopupToFront(it) }
+        popups.values.toList().forEach { bringPopupToFront(it) }
     }
 
     private fun closeOverlay() {
@@ -222,31 +237,63 @@ class FloatingService : Service() {
 
     // ---------- Popup: mỗi từ 1 cái, luôn nằm trên cùng ----------
 
-    private fun togglePopup(key: String, message: String, atX: Int, atY: Int) {
+    private fun togglePopup(key: String, word: String, anchor: Rect) {
         if (popups.containsKey(key)) {   // bấm lần 2 -> tắt
             closePopup(key)
             return
         }
-        showPopup(key, message, atX, atY)
+
+        val (title, body) = when {
+            Dictionary.size == 0 && Dictionary.loading -> word to "Đang nạp từ điển…"
+            Dictionary.size == 0 -> word to (Dictionary.error
+                ?: "Thư mục từ điển trống:\n${Dictionary.folder(this).absolutePath}")
+            else -> {
+                val hit = Dictionary.lookup(word)
+                if (hit == null) word to "Chưa có trong từ điển"
+                else {
+                    val head = if (hit.first.equals(word, ignoreCase = true)) word else "$word → ${hit.first}"
+                    head to hit.second
+                }
+            }
+        }
+        showPopup(key, title, body, anchor)
     }
 
-    private fun showPopup(key: String, message: String, atX: Int, atY: Int) {
+    private fun showPopup(key: String, title: String, body: String, anchor: Rect) {
         closePopup(key)
+
+        val maxTextW = (260 * dp).toInt()
+        val shownBody = if (body.length > 600) body.take(600) + "…" else body
 
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+            gravity = Gravity.TOP
             setPadding((16 * dp).toInt(), (10 * dp).toInt(), (4 * dp).toInt(), (10 * dp).toInt())
             background = GradientDrawable().apply {
                 setColor(0xF2212121.toInt())
                 cornerRadius = 16 * dp
             }
-            addView(TextView(context).apply {
-                text = message
-                setTextColor(Color.WHITE)
-                textSize = 20f
-                maxWidth = (240 * dp).toInt()
+
+            addView(LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(TextView(context).apply {
+                    text = title
+                    setTextColor(Color.WHITE)
+                    textSize = 20f
+                    setTypeface(typeface, Typeface.BOLD)
+                    maxWidth = maxTextW
+                })
+                if (shownBody.isNotBlank()) {
+                    addView(TextView(context).apply {
+                        text = shownBody
+                        setTextColor(0xFFCCCCCC.toInt())
+                        textSize = 15f
+                        maxWidth = maxTextW
+                        setPadding(0, (4 * dp).toInt(), 0, 0)
+                    })
+                }
             })
+
             addView(TextView(context).apply {
                 text = "✕"
                 setTextColor(Color.WHITE)
@@ -256,26 +303,29 @@ class FloatingService : Service() {
             })
         }
 
-        val maxX = (resources.displayMetrics.widthPixels - 300 * dp).toInt().coerceAtLeast(0)
+        // Đo trước để biết popup cao/rộng bao nhiêu, đặt ngay phía trên từ (hết chỗ thì xuống dưới)
+        val screenW = resources.displayMetrics.widthPixels
+        box.measure(
+            View.MeasureSpec.makeMeasureSpec(screenW, View.MeasureSpec.AT_MOST),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        )
+        val gap = (6 * dp).toInt()
+        var py = anchor.top - box.measuredHeight - gap
+        if (py < 0) py = anchor.bottom + gap
+        val px = anchor.left.coerceIn(0, (screenW - box.measuredWidth).coerceAtLeast(0))
+
         val lp = layoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = atX.coerceIn(0, maxX)
-            y = (atY - 56 * dp).toInt().coerceAtLeast(0)   // nằm phía trên từ để không che
+            x = px
+            y = py
         }
 
         popups[key] = box
         wm.addView(box, lp)   // add sau cùng -> nằm trên cùng
-    }
-
-    // Dùng khi overlay vừa được add sau popup (ví dụ popup "note" lỗi) để popup vẫn ở trên
-    private fun bringPopupToFront(v: View) {
-        val lp = v.layoutParams as? WindowManager.LayoutParams ?: return
-        runCatching { wm.removeView(v) }
-        wm.addView(v, lp)
     }
 
     private fun closePopup(key: String) {
@@ -288,7 +338,11 @@ class FloatingService : Service() {
     }
 
     // thông báo lỗi/trạng thái cũng là popup overlay, không dùng Toast
-    private fun note(msg: String) = showPopup("note", msg, (40 * dp).toInt(), (160 * dp).toInt())
+    private fun note(msg: String) {
+        val x = (40 * dp).toInt()
+        val y = (160 * dp).toInt()
+        showPopup("note", msg, "", Rect(x, y, x, y))
+    }
 
     // ---------- Tiện ích ----------
 
