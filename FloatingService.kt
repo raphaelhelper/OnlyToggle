@@ -20,10 +20,12 @@ import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.provider.Settings
 import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.LayoutInflater
@@ -75,8 +77,18 @@ class FloatingService : Service() {
     }
 
     private fun reloadDictionary() {
-        val ctx = applicationContext
-        Thread { Dictionary.loadIfChanged(ctx) }.start()
+        Thread { Dictionary.loadIfChanged() }.start()
+    }
+
+    // Chưa có quyền "Truy cập mọi tệp" -> mở thẳng trang cấp quyền của app
+    private fun ensureFileAccess(): Boolean {
+        if (Dictionary.hasAccess()) return true
+        val i = Intent(
+            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+            Uri.parse("package:$packageName")
+        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { startActivity(i) }
+        return false
     }
 
     @Suppress("DEPRECATION")
@@ -179,7 +191,12 @@ class FloatingService : Service() {
     private fun scan() {
         if (scanning || overlay != null) return
         closeAllPopups()
+
+        if (!ensureFileAccess()) {
+            return note("Bật 'Cho phép truy cập mọi tệp' rồi quay lại bấm bubble")
+        }
         reloadDictionary()   // file từ điển đổi thì tự nạp lại (không đổi thì bỏ qua ngay)
+
         val img = latest ?: return note("Chưa có ảnh màn hình, thử lại")
 
         // Bitmap giữ nguyên phần đệm bên phải; tọa độ chữ vẫn khớp màn hình
@@ -246,7 +263,7 @@ class FloatingService : Service() {
         val (title, body) = when {
             Dictionary.size == 0 && Dictionary.loading -> word to "Đang nạp từ điển…"
             Dictionary.size == 0 -> word to (Dictionary.error
-                ?: "Thư mục từ điển trống:\n${Dictionary.folder(this).absolutePath}")
+                ?: "Thư mục từ điển trống:\n${Dictionary.folder().absolutePath}")
             else -> {
                 val hit = Dictionary.lookup(word)
                 if (hit == null) word to "Chưa có trong từ điển"
