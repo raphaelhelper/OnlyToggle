@@ -10,3 +10,4 @@ cp res_layout_activity_main.xml app/src/main/res/layout/activity_main.xml
 cp res_values_styles.xml app/src/main/res/values/styles.xml
 cp layout_bubble.xml app/src/main/res/layout/layout_bubble.xml
 cp FloatingService.kt app/src/main/java/com/qui/wordpopup/FloatingService.kt
+cp Dictionary.kt app/src/main/java/com/qui/wordpopup/Dictionary.kt
