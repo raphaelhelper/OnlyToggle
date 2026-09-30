@@ -40,8 +40,10 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlin.math.abs
 
 /**
- * Kết quả KHÔNG dùng Toast nữa (Toast bị hệ thống ẩn khi app chạy nền).
- * Mọi thông báo đều là cửa sổ overlay vẽ đè lên app khác, có nút ✕ để tắt.
+ * Bấm bubble -> quét màn hình, hiện lớp phủ xanh che toàn màn hình.
+ * Bấm từ nào -> popup của từ đó (bấm lần nữa thì tắt), nhiều popup cùng lúc.
+ * Bấm bubble lần nữa -> tắt lớp phủ + tắt hết popup.
+ * Thứ tự z (dưới -> trên): lớp phủ < bubble < popup.
  */
 class FloatingService : Service() {
 
@@ -56,8 +58,9 @@ class FloatingService : Service() {
     private var latest: Image? = null   // frame màn hình mới nhất
 
     private var bubble: View? = null
+    private var bubbleLp: WindowManager.LayoutParams? = null
     private var overlay: View? = null   // lớp xanh chờ chạm
-    private var popup: View? = null     // popup kết quả
+    private val popups = LinkedHashMap<String, View>()   // mỗi từ 1 popup
     private var scanning = false
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -101,7 +104,7 @@ class FloatingService : Service() {
         return START_NOT_STICKY
     }
 
-    // ---------- Bong bóng: kéo được, bấm để quét ----------
+    // ---------- Bong bóng: kéo được, bấm để quét / tắt lớp phủ ----------
 
     @SuppressLint("ClickableViewAccessibility")
     private fun showBubble() {
@@ -130,20 +133,38 @@ class FloatingService : Service() {
                     wm.updateViewLayout(view, lp)
                 }
                 MotionEvent.ACTION_UP ->
-                    if (abs(e.rawX - downX) < 10 && abs(e.rawY - downY) < 10) scan()
+                    if (abs(e.rawX - downX) < 10 && abs(e.rawY - downY) < 10) onBubbleTap()
             }
             true
         }
 
         bubble = view
+        bubbleLp = lp
         wm.addView(view, lp)
+    }
+
+    private fun onBubbleTap() {
+        if (overlay != null) {      // đang có lớp phủ -> tắt hết
+            closeOverlay()
+            closeAllPopups()
+        } else {
+            scan()
+        }
+    }
+
+    // Window add sau thì nằm trên. Remove rồi add lại bubble để nó nổi lên trên lớp phủ.
+    private fun bringBubbleToFront() {
+        val v = bubble ?: return
+        val lp = bubbleLp ?: return
+        runCatching { wm.removeView(v) }
+        wm.addView(v, lp)
     }
 
     // ---------- Quét: OCR frame mới nhất ----------
 
     private fun scan() {
         if (scanning || overlay != null) return
-        closePopup()
+        closeAllPopups()
         val img = latest ?: return note("Chưa có ảnh màn hình, thử lại")
 
         // Bitmap giữ nguyên phần đệm bên phải; tọa độ chữ vẫn khớp màn hình
@@ -159,7 +180,7 @@ class FloatingService : Service() {
             .addOnCompleteListener { scanning = false }
     }
 
-    // ---------- Lớp xanh: chạm vào từ nào thì lấy từ đó ----------
+    // ---------- Lớp xanh: bấm từ nào toggle popup từ đó, lớp phủ giữ nguyên ----------
 
     @SuppressLint("ClickableViewAccessibility")
     private fun showOverlay(text: Text) {
@@ -170,14 +191,13 @@ class FloatingService : Service() {
             if (e.action == MotionEvent.ACTION_DOWN) {
                 val x = e.rawX.toInt()
                 val y = e.rawY.toInt()
-                val word = elements
-                    .firstOrNull { it.boundingBox?.contains(x, y) == true }
-                    ?.text
-                    ?.trim { !it.isLetterOrDigit() }
-
-                closeOverlay()
-                if (word.isNullOrEmpty()) showPopup("Không tìm thấy từ (đọc được ${elements.size} từ)", x, y)
-                else showPopup(word, x, y)
+                val el = elements.firstOrNull { it.boundingBox?.contains(x, y) == true }
+                val box = el?.boundingBox
+                val word = el?.text?.trim { !it.isLetterOrDigit() }
+                // overlay KHÔNG đóng; bấm trúng chỗ trống thì bỏ qua
+                if (box != null && !word.isNullOrEmpty()) {
+                    togglePopup("${box.left},${box.top}", word, box.left, box.top)
+                }
             }
             true
         }
@@ -191,6 +211,8 @@ class FloatingService : Service() {
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
             )
         )
+        bringBubbleToFront()   // bubble nằm trên lớp phủ để còn bấm tắt được
+        popups.values.forEach { bringPopupToFront(it) }
     }
 
     private fun closeOverlay() {
@@ -198,10 +220,18 @@ class FloatingService : Service() {
         overlay = null
     }
 
-    // ---------- Popup kết quả: vẽ đè lên mọi app, chỉ tắt khi bấm ✕ ----------
+    // ---------- Popup: mỗi từ 1 cái, luôn nằm trên cùng ----------
 
-    private fun showPopup(message: String, atX: Int, atY: Int) {
-        closePopup()
+    private fun togglePopup(key: String, message: String, atX: Int, atY: Int) {
+        if (popups.containsKey(key)) {   // bấm lần 2 -> tắt
+            closePopup(key)
+            return
+        }
+        showPopup(key, message, atX, atY)
+    }
+
+    private fun showPopup(key: String, message: String, atX: Int, atY: Int) {
+        closePopup(key)
 
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -222,7 +252,7 @@ class FloatingService : Service() {
                 setTextColor(Color.WHITE)
                 textSize = 20f
                 setPadding((16 * dp).toInt(), (6 * dp).toInt(), (12 * dp).toInt(), (6 * dp).toInt())
-                setOnClickListener { closePopup() }
+                setOnClickListener { closePopup(key) }
             })
         }
 
@@ -233,21 +263,32 @@ class FloatingService : Service() {
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = (atX - 60 * dp).toInt().coerceIn(0, maxX)
-            y = (atY - 90 * dp).toInt().coerceAtLeast(0)   // nằm phía trên chỗ chạm để không che từ
+            x = atX.coerceIn(0, maxX)
+            y = (atY - 56 * dp).toInt().coerceAtLeast(0)   // nằm phía trên từ để không che
         }
 
-        popup = box
-        wm.addView(box, lp)
+        popups[key] = box
+        wm.addView(box, lp)   // add sau cùng -> nằm trên cùng
     }
 
-    private fun closePopup() {
-        popup?.let { runCatching { wm.removeView(it) } }
-        popup = null
+    // Dùng khi overlay vừa được add sau popup (ví dụ popup "note" lỗi) để popup vẫn ở trên
+    private fun bringPopupToFront(v: View) {
+        val lp = v.layoutParams as? WindowManager.LayoutParams ?: return
+        runCatching { wm.removeView(v) }
+        wm.addView(v, lp)
+    }
+
+    private fun closePopup(key: String) {
+        popups.remove(key)?.let { runCatching { wm.removeView(it) } }
+    }
+
+    private fun closeAllPopups() {
+        popups.values.forEach { runCatching { wm.removeView(it) } }
+        popups.clear()
     }
 
     // thông báo lỗi/trạng thái cũng là popup overlay, không dùng Toast
-    private fun note(msg: String) = showPopup(msg, (40 * dp).toInt(), (160 * dp).toInt())
+    private fun note(msg: String) = showPopup("note", msg, (40 * dp).toInt(), (160 * dp).toInt())
 
     // ---------- Tiện ích ----------
 
@@ -276,7 +317,7 @@ class FloatingService : Service() {
     }
 
     override fun onDestroy() {
-        closePopup()
+        closeAllPopups()
         closeOverlay()
         bubble?.let { runCatching { wm.removeView(it) } }
         latest?.close()
