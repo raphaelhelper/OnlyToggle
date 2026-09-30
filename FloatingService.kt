@@ -45,12 +45,19 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlin.math.abs
 
 /**
- * Bấm bubble -> hiện lớp phủ xanh ngay lập tức -> quét màn hình ngầm.
- * Bấm từ nào -> popup nghĩa của từ đó (cuộn được, có nút X để tắt), nhiều popup cùng lúc.
+ * Bấm bubble -> lớp phủ hiện NGAY (vàng = đang quét, xanh = sẵn sàng).
+ * Bấm từ nào -> popup nghĩa của từ đó (bấm nút > hoặc bấm từ lần nữa thì tắt), nhiều popup cùng lúc.
+ * Nghĩa dài thì cuộn được trong popup.
  * Bấm bubble lần nữa -> tắt lớp phủ + tắt hết popup.
  * Thứ tự z (dưới -> trên): lớp phủ < bubble < popup.
  */
 class FloatingService : Service() {
+
+    private companion object {
+        const val TINT_SCANNING = 0x22FFFF00   // vàng nhạt
+        const val TINT_READY = 0x2200FF00      // xanh nhạt
+        const val KEY_WAIT = "wait"
+    }
 
     private lateinit var wm: WindowManager
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
@@ -64,12 +71,13 @@ class FloatingService : Service() {
 
     private var bubble: View? = null
     private var bubbleLp: WindowManager.LayoutParams? = null
-    private var overlay: View? = null   // lớp xanh chờ chạm
+    private var overlay: View? = null   // lớp phủ chờ chạm
     private val popups = LinkedHashMap<String, View>()   // mỗi từ 1 popup
-    
-    // OCR States
-    private var scanning = false
-    private var currentTextData: Text? = null // Lưu kết quả text mới nhất
+
+    // Kết quả OCR của lần quét hiện tại
+    private var elements: List<Text.Element> = emptyList()
+    private var ready = false
+    private var scanId = 0   // tăng mỗi lần quét/hủy; kết quả OCR cũ so id không khớp thì bỏ
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -78,21 +86,10 @@ class FloatingService : Service() {
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         startAsForeground()   // phải gọi trước getMediaProjection (Android 14+)
         reloadDictionary()
-        warmUpOcr()           // Bắt AI khởi động ngầm ngay lập tức
     }
 
     private fun reloadDictionary() {
         Thread { Dictionary.loadIfChanged() }.start()
-    }
-
-    // Ép ML Kit nạp model vào RAM bằng một ảnh giả 1x1 pixel
-    private fun warmUpOcr() {
-        Thread {
-            runCatching {
-                val dummyBitmap = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
-                recognizer.process(InputImage.fromBitmap(dummyBitmap, 0))
-            }
-        }.start()
     }
 
     // Chưa có quyền "Truy cập mọi tệp" -> mở thẳng trang cấp quyền của app
@@ -179,7 +176,8 @@ class FloatingService : Service() {
     }
 
     private fun onBubbleTap() {
-        if (overlay != null) {
+        if (overlay != null) {      // đang có lớp phủ (kể cả đang quét dở) -> tắt hết
+            scanId++                // hủy kết quả OCR đang chạy
             closeOverlay()
             closeAllPopups()
         } else {
@@ -187,6 +185,7 @@ class FloatingService : Service() {
         }
     }
 
+    // Window add sau thì nằm trên. Remove rồi add lại để nổi lên trên lớp phủ.
     private fun bringBubbleToFront() {
         val v = bubble ?: return
         val lp = bubbleLp ?: return
@@ -200,75 +199,68 @@ class FloatingService : Service() {
         wm.addView(v, lp)
     }
 
-    // ---------- Quét: UX tức thì, OCR chạy ngầm ----------
+    // ---------- Quét: hiện lớp phủ ngay, OCR chạy ngầm ----------
 
     private fun scan() {
-        if (scanning || overlay != null) return
+        if (overlay != null) return
         closeAllPopups()
 
         if (!ensureFileAccess()) {
             return note("Bật 'Cho phép truy cập mọi tệp' rồi quay lại bấm bubble")
         }
-        reloadDictionary()
+        reloadDictionary()   // file từ điển đổi thì tự nạp lại (không đổi thì bỏ qua ngay)
 
         val img = latest ?: return note("Chưa có ảnh màn hình, thử lại")
 
-        // Hiện lớp kính xanh ngay lập tức để người dùng biết app đã nhận lệnh
-        showOverlayInstantly()
-        scanning = true
-        currentTextData = null
+        // Bitmap giữ nguyên phần đệm bên phải; tọa độ chữ vẫn khớp màn hình
+        val plane = img.planes[0]
+        val bmp = Bitmap.createBitmap(plane.rowStride / plane.pixelStride, img.height, Bitmap.Config.ARGB_8888)
+        plane.buffer.rewind()
+        bmp.copyPixelsFromBuffer(plane.buffer)
 
-        // Delay 50ms cho UI vẽ xong mới bắt đầu chiếm CPU quét ảnh
-        handler.postDelayed({
-            try {
-                val plane = img.planes[0]
-                val bmp = Bitmap.createBitmap(plane.rowStride / plane.pixelStride, img.height, Bitmap.Config.ARGB_8888)
-                plane.buffer.rewind()
-                bmp.copyPixelsFromBuffer(plane.buffer)
+        val id = ++scanId
+        elements = emptyList()
+        ready = false
+        showOverlay()   // hiện ngay, chưa cần chờ OCR
 
-                recognizer.process(InputImage.fromBitmap(bmp, 0))
-                    .addOnSuccessListener { 
-                        currentTextData = it 
-                    }
-                    .addOnFailureListener { 
-                        note("OCR lỗi: ${it.message}")
-                        closeOverlay()
-                    }
-                    .addOnCompleteListener { 
-                        scanning = false 
-                    }
-            } catch (e: Exception) {
-                scanning = false
-                closeOverlay()
-                note("Lỗi xử lý ảnh")
+        recognizer.process(InputImage.fromBitmap(bmp, 0))
+            .addOnSuccessListener { t ->
+                if (id != scanId || overlay == null) return@addOnSuccessListener   // đã hủy
+                elements = t.textBlocks.flatMap { it.lines }.flatMap { it.elements }
+                ready = true
+                overlay?.setBackgroundColor(TINT_READY)
+                closePopup(KEY_WAIT)
             }
-        }, 50)
+            .addOnFailureListener {
+                if (id != scanId || overlay == null) return@addOnFailureListener
+                closeOverlay()
+                closeAllPopups()
+                note("OCR lỗi: ${it.message}")
+            }
     }
 
-    // ---------- Lớp xanh: lấy dữ liệu từ currentTextData ----------
+    // ---------- Lớp phủ: bấm từ nào toggle popup từ đó, lớp phủ giữ nguyên ----------
 
     @SuppressLint("ClickableViewAccessibility")
-    private fun showOverlayInstantly() {
-        val view = View(this).apply { setBackgroundColor(0x2200FF00) }
+    private fun showOverlay() {
+        val view = View(this).apply { setBackgroundColor(TINT_SCANNING) }
 
         view.setOnTouchListener { _, e ->
             if (e.action == MotionEvent.ACTION_DOWN) {
-                if (scanning || currentTextData == null) {
-                    note("Đang quét chữ, đợi 1 tẹo nhé...")
-                    return@setOnTouchListener true
-                }
-
-                val text = currentTextData!!
                 val x = e.rawX.toInt()
                 val y = e.rawY.toInt()
-                
-                val elements = text.textBlocks.flatMap { it.lines }.flatMap { it.elements }
-                val el = elements.firstOrNull { it.boundingBox?.contains(x, y) == true }
-                val box = el?.boundingBox
-                val word = el?.text?.trim { !it.isLetterOrDigit() }
-                
-                if (box != null && !word.isNullOrEmpty()) {
-                    togglePopup("${box.left},${box.top}", word, box)
+
+                if (!ready) {
+                    // OCR chưa xong
+                    showPopup(KEY_WAIT, "Đang quét…", "", Rect(x, y, x, y))
+                } else {
+                    val el = elements.firstOrNull { it.boundingBox?.contains(x, y) == true }
+                    val box = el?.boundingBox
+                    val word = el?.text?.trim { !it.isLetterOrDigit() }
+                    // overlay KHÔNG đóng; bấm trúng chỗ trống thì bỏ qua
+                    if (box != null && !word.isNullOrEmpty()) {
+                        togglePopup("${box.left},${box.top}", word, box)
+                    }
                 }
             }
             true
@@ -283,7 +275,7 @@ class FloatingService : Service() {
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
             )
         )
-        bringBubbleToFront()
+        bringBubbleToFront()   // bubble nằm trên lớp phủ để còn bấm tắt được
         popups.values.toList().forEach { bringPopupToFront(it) }
     }
 
@@ -292,17 +284,18 @@ class FloatingService : Service() {
         overlay = null
     }
 
-    // ---------- Popup: Hỗ trợ cuộn & Nút tắt ----------
+    // ---------- Popup: mỗi từ 1 cái, luôn nằm trên cùng ----------
 
     private fun togglePopup(key: String, word: String, anchor: Rect) {
-        if (popups.containsKey(key)) {
+        if (popups.containsKey(key)) {   // bấm lần 2 -> tắt
             closePopup(key)
             return
         }
 
         val (title, body) = when {
             Dictionary.size == 0 && Dictionary.loading -> word to "Đang nạp từ điển…"
-            Dictionary.size == 0 -> word to (Dictionary.error ?: "Thư mục từ điển trống:\n${Dictionary.folder().absolutePath}")
+            Dictionary.size == 0 -> word to (Dictionary.error
+                ?: "Thư mục từ điển trống:\n${Dictionary.folder().absolutePath}")
             else -> {
                 val hit = Dictionary.lookup(word)
                 if (hit == null) word to "Chưa có trong từ điển"
@@ -320,74 +313,93 @@ class FloatingService : Service() {
 
         val maxTextW = (260 * dp).toInt()
 
+        // Phần nghĩa nằm trong ScrollView: dài thì cuộn, không cắt nội dung
+        val scroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = true
+            isScrollbarFadingEnabled = false          // thanh cuộn luôn hiện
+            scrollBarStyle = View.SCROLLBARS_INSIDE_OVERLAY
+            overScrollMode = View.OVER_SCROLL_NEVER
+            addView(TextView(context).apply {
+                text = body
+                setTextColor(0xFFCCCCCC.toInt())
+                textSize = 15f
+                maxWidth = maxTextW
+                setPadding(0, (4 * dp).toInt(), (10 * dp).toInt(), 0)
+            })
+        }
+
+        val column = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(TextView(context).apply {
+                text = title
+                setTextColor(Color.WHITE)
+                textSize = 20f
+                setTypeface(typeface, Typeface.BOLD)
+                maxWidth = maxTextW
+            })
+            if (body.isNotBlank()) {
+                addView(scroll, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ))
+            }
+        }
+
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.TOP
-            setPadding((16 * dp).toInt(), (12 * dp).toInt(), (4 * dp).toInt(), (12 * dp).toInt())
+            setPadding((16 * dp).toInt(), (10 * dp).toInt(), (4 * dp).toInt(), (10 * dp).toInt())
             background = GradientDrawable().apply {
                 setColor(0xF2212121.toInt())
                 cornerRadius = 16 * dp
             }
-
-            // --- Vùng chứa Chữ (Tiêu đề + Cuộn thân bài) ---
-            addView(LinearLayout(context).apply {
-                orientation = LinearLayout.VERTICAL
-                
-                addView(TextView(context).apply {
-                    text = title
-                    setTextColor(Color.WHITE)
-                    textSize = 20f
-                    setTypeface(typeface, Typeface.BOLD)
-                    maxWidth = maxTextW
-                })
-                
-                if (body.isNotBlank()) {
-                    // Tạo ScrollView tuỳ chỉnh giới hạn chiều cao tối đa là 250dp
-                    val scroll = object : ScrollView(context) {
-                        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-                            val maxH = (250 * dp).toInt()
-                            val hSize = View.MeasureSpec.getSize(heightMeasureSpec)
-                            if (hSize > maxH || View.MeasureSpec.getMode(heightMeasureSpec) == View.MeasureSpec.UNSPECIFIED) {
-                                super.onMeasure(widthMeasureSpec, View.MeasureSpec.makeMeasureSpec(maxH, View.MeasureSpec.AT_MOST))
-                            } else {
-                                super.onMeasure(widthMeasureSpec, heightMeasureSpec)
-                            }
-                        }
-                    }
-                    
-                    scroll.addView(TextView(context).apply {
-                        text = body // Bỏ cắt chữ, truyền nguyên văn
-                        setTextColor(0xFFCCCCCC.toInt())
-                        textSize = 15f
-                        maxWidth = maxTextW
-                        setPadding(0, (6 * dp).toInt(), 0, (6 * dp).toInt())
-                    })
-                    addView(scroll)
-                }
-            })
-
-            // --- Nút ✕ để đóng ---
+            addView(column)
             addView(TextView(context).apply {
-                text = "✕"
-                setTextColor(Color.parseColor("#FF6B6B")) // Chữ đỏ nhạt để nổi bật
-                textSize = 20f
-                setTypeface(typeface, Typeface.BOLD)
-                // Cho padding rộng ra để vùng chạm dễ bấm
-                setPadding((12 * dp).toInt(), 0, (12 * dp).toInt(), (12 * dp).toInt())
+                text = "›"                       // nút đóng popup (đổi ký tự khác ở đây nếu muốn)
+                setTextColor(Color.WHITE)
+                textSize = 30f
+                setPadding((16 * dp).toInt(), 0, (12 * dp).toInt(), (6 * dp).toInt())
                 setOnClickListener { closePopup(key) }
             })
         }
 
-        // Đo kích thước thực tế của Popup để tính toạ độ
         val screenW = resources.displayMetrics.widthPixels
-        box.measure(
+        val screenH = resources.displayMetrics.heightPixels
+        val gap = (6 * dp).toInt()
+
+        fun measureBox() = box.measure(
             View.MeasureSpec.makeMeasureSpec(screenW, View.MeasureSpec.AT_MOST),
             View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
         )
-        
-        val gap = (6 * dp).toInt()
-        var py = anchor.top - box.measuredHeight - gap
-        if (py < 0) py = anchor.bottom + gap
+        measureBox()
+
+        // Chọn phía có chỗ (trên hoặc dưới từ); nếu vẫn thiếu thì thu ScrollView lại cho vừa
+        val fullH = box.measuredHeight
+        val spaceAbove = anchor.top - gap
+        val spaceBelow = screenH - anchor.bottom - gap
+        val placeAbove: Boolean
+        val availH: Int
+        when {
+            fullH <= spaceAbove -> { placeAbove = true; availH = fullH }
+            fullH <= spaceBelow -> { placeAbove = false; availH = fullH }
+            else -> {
+                placeAbove = spaceAbove >= spaceBelow
+                availH = maxOf(spaceAbove, spaceBelow)
+                    .coerceAtLeast((160 * dp).toInt())
+                    .coerceAtMost((screenH * 0.9f).toInt())
+            }
+        }
+        if (fullH > availH && body.isNotBlank()) {
+            val newScrollH = (scroll.measuredHeight - (fullH - availH)).coerceAtLeast((60 * dp).toInt())
+            scroll.layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, newScrollH
+            )
+            measureBox()
+        }
+
+        val boxH = box.measuredHeight
+        val py = (if (placeAbove) anchor.top - boxH - gap else anchor.bottom + gap)
+            .coerceIn(0, (screenH - boxH).coerceAtLeast(0))
         val px = anchor.left.coerceIn(0, (screenW - box.measuredWidth).coerceAtLeast(0))
 
         val lp = layoutParams(
@@ -401,7 +413,7 @@ class FloatingService : Service() {
         }
 
         popups[key] = box
-        wm.addView(box, lp)   
+        wm.addView(box, lp)   // add sau cùng -> nằm trên cùng
     }
 
     private fun closePopup(key: String) {
@@ -413,6 +425,7 @@ class FloatingService : Service() {
         popups.clear()
     }
 
+    // thông báo lỗi/trạng thái cũng là popup overlay, không dùng Toast
     private fun note(msg: String) {
         val x = (40 * dp).toInt()
         val y = (160 * dp).toInt()
@@ -425,6 +438,7 @@ class FloatingService : Service() {
         w, h, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
         flags or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN, PixelFormat.TRANSLUCENT
     ).apply {
+        // Máy có tai thỏ: nếu thiếu dòng này cửa sổ bị đẩy xuống ~45px so với màn hình thật
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
         }
@@ -445,6 +459,7 @@ class FloatingService : Service() {
     }
 
     override fun onDestroy() {
+        scanId++
         closeAllPopups()
         closeOverlay()
         bubble?.let { runCatching { wm.removeView(it) } }
