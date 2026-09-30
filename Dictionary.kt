@@ -1,6 +1,7 @@
 package com.qui.wordpopup
 
-import android.content.Context
+import android.os.Build
+import android.os.Environment
 import java.io.File
 
 object Dictionary {
@@ -15,15 +16,22 @@ object Dictionary {
 
     val size: Int get() = map.size
 
-    fun folder(context: Context): File {
-        val base = context.getExternalFilesDir(null) ?: context.filesDir
-        return File(base, "dict").also { it.mkdirs() }
-    }
+    /** /storage/emulated/0/WordPopup */
+    fun folder(): File = File(Environment.getExternalStorageDirectory(), "WordPopup")
+
+    /** Android 11+ cần quyền "Truy cập mọi tệp" mới đọc được thư mục ngoài app. */
+    fun hasAccess(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
 
     /** Nạp lại toàn bộ thư mục nếu có file thêm/sửa/xóa. Gọi trên thread nền. */
     @Synchronized
-    fun loadIfChanged(context: Context) {
-        val files = folder(context)
+    fun loadIfChanged() {
+        if (!hasAccess()) {
+            error = "Chưa cấp quyền 'Truy cập mọi tệp' cho app"
+            return
+        }
+        val dir = folder().also { it.mkdirs() }
+        val files = dir
             .listFiles { f -> f.isFile && f.name.endsWith(".txt", ignoreCase = true) }
             ?.sortedBy { it.name }
             ?: emptyList()
